@@ -557,6 +557,34 @@ function watchConnection(p, id){
       pc.addEventListener("connectionstatechange", onState);
       onState();
     }
+    /* ОБНАРУЖЕНИЕ «ЗАВИСШЕГО ВИДЕО»: звук идёт, а картинка замерла.
+       Сравниваем currentTime видео между тиками — если не растёт, хотя
+       соединение живо и у собеседника есть видео — лечим. */
+    if (p.tile && p.gotStream){
+      const v = p.tile.querySelector("video");
+      const connected = pc && (pc.iceConnectionState === "connected" || pc.iceConnectionState === "completed");
+      if (v && v.videoWidth > 0 && connected && p.hasVideo){
+        const ct = v.currentTime;
+        if (p.lastVT != null && Math.abs(ct - p.lastVT) < 0.05){
+          p.freezeN = (p.freezeN || 0) + 1;
+        } else {
+          p.freezeN = 0;
+        }
+        p.lastVT = ct;
+        if (p.freezeN === 2){
+          /* лёгкое лечение — перецепить тот же поток и пнуть воспроизведение */
+          try{ const s = v.srcObject; v.srcObject = null; v.srcObject = s; v.play().catch(()=>{}); }catch(_){}
+        } else if (p.freezeN >= 4){
+          /* не помогло — просим собеседника переслать видео заново */
+          p.freezeN = 0;
+          p.rec.sendNeed(id);
+          resendStreamTo(id);
+          try{ pc.restartIce && pc.restartIce(); }catch(_){}
+        }
+      } else {
+        p.freezeN = 0; p.lastVT = null;
+      }
+    }
     p.watchT = setTimeout(tick, 2000);
   };
   tick();
@@ -916,9 +944,31 @@ async function flipCam(){
   if (!localStream || !localStream.getVideoTracks().length) return;
   if ($("btnFlip").dataset.busy) return;
   $("btnFlip").dataset.busy = "1";
+  const ot = localStream.getVideoTracks()[0];
+  const curId = ot.getSettings ? ot.getSettings().deviceId : null;
   try{
     facing = (facing==="user") ? "environment" : "user";
-    const ns = await openCamera(facing === "user");
+    let ns = await openCamera(facing === "user");
+    /* Huawei и часть Android отдают по facingMode ТУ ЖЕ камеру — определяем это
+       и принудительно берём камеру другой группы по deviceId */
+    let newId = ns ? (ns.getVideoTracks()[0].getSettings ? ns.getVideoTracks()[0].getSettings().deviceId : null) : null;
+    if (!ns || (curId && newId && newId === curId)){
+      await buildCameraList();
+      const wantIds = (facing === "user") ? frontIds : backIds;
+      let opened = null;
+      for (const id of wantIds){
+        if (id === curId) continue;                 // нужна именно ДРУГАЯ камера
+        try{ opened = await navigator.mediaDevices.getUserMedia({ video:{ deviceId:{ exact:id } }, audio:false }); if (opened) break; }catch(_){}
+      }
+      /* если в нужной группе пусто (метки не распознались) — берём любую другую камеру */
+      if (!opened){
+        for (const d of videoInputs){
+          if (d.deviceId === curId) continue;
+          try{ opened = await navigator.mediaDevices.getUserMedia({ video:{ deviceId:{ exact:d.deviceId } }, audio:false }); if (opened) break; }catch(_){}
+        }
+      }
+      if (opened){ if (ns) ns.getTracks().forEach(t=>t.stop()); ns = opened; }
+    }
     if (!ns) throw new Error("no camera");
     await swapVideoTrack(ns);
   }catch(e){
@@ -1089,8 +1139,8 @@ function fatal(msg){
    Файл режется на блоки по 48 КБ, каждый шифруется AES-GCM ключом, который
    выводится из пароля комнаты. Получатель подтверждает блоки; при обрыве и
    переподключении отправитель продолжает с последнего неподтверждённого. */
-const CHUNK = 48 * 1024;
-const WINDOW = 6;              // блоков «в полёте» — баланс скорости и надёжности
+const CHUNK = 16 * 1024;       // 16 КБ — безопасно проходит через канал данных WebRTC
+const WINDOW = 64;             // до 64 блоков «в полёте» — это поднимает скорость в разы
 const sendXfers = new Map();
 const recvXfers = new Map();
 
@@ -1169,17 +1219,21 @@ async function pumpSend(x){
   if (x.acked+1 >= x.total) updateXferUI("send", x, "Доставлено", "done", true);
   else updateXferUI("send", x, "Отправка", x.paused ? "busy" : "");
 
-  /* СТРАХОВКА ОТ ПОТЕРЬ: если окно «упёрлось» в неподтверждённый блок,
-     через паузу откатываем указатель к acked+1 и пересылаем пропавшие блоки */
+  /* СТРАХОВКА ОТ ПОТЕРЬ: если за паузу подтверждения не сдвинулись —
+     откатываем указатель к первому неподтверждённому и пересылаем пропавшие.
+     Если прогресс есть, просто продолжаем накачку. */
   if (!x.cancel && x.acked + 1 < x.total){
     clearTimeout(x.stallT);
+    const ackAtSchedule = x.acked;
     x.stallT = setTimeout(()=>{
       if (x.cancel || x.paused) return;
-      if (x.acked + 1 < x.total){
-        if (x.acked + 1 < x.sent) x.sent = x.acked + 1;   // вернуться к первому неподтверждённому
-        pumpSend(x);
+      if (x.acked + 1 >= x.total) return;
+      if (x.acked === ackAtSchedule){
+        /* реального прогресса не было — пересылаем с первого неподтверждённого */
+        if (x.acked + 1 < x.sent) x.sent = x.acked + 1;
       }
-    }, 1200);
+      pumpSend(x);
+    }, 2000);
   }
 }
 async function onFileChunk(peerId, data, meta){
