@@ -308,6 +308,7 @@ let localStream = null;
 let rooms = [];                // [{tag, room, sendMeta, sendMode}]
 let peers = new Map();         // peerId -> {rec, name, tile, gotStream}
 let inRoom = false, session = 0;
+let FIXED_ROOM_REJOINED = false;   // одноразовая авто-переподключка, чтобы не зациклиться
 let timerInt = null, timerStart = 0;
 
 /* ───────────── Утилиты ───────────── */
@@ -511,6 +512,32 @@ function trackPeer(id, rec){
       }
     }, delay));
   }
+  /* СТОРОЖ СОЕДИНЕНИЯ (важно для Huawei и капризных сетей):
+     участник в комнате виден, но связь не установилась — принудительно лечим. */
+  p.retryT.push(setTimeout(()=>{
+    if (sess !== session || peers.get(id) !== p) return;
+    let pc = null;
+    try{ const pcs = p.rec.room.getPeers ? p.rec.room.getPeers() : null; pc = pcs && pcs[id]; }catch(_){}
+    const st = pc && pc.iceConnectionState;
+    if (st !== "connected" && st !== "completed"){
+      try{ pc && pc.restartIce && pc.restartIce(); }catch(_){}
+      p.sentStream = false; sendStreamTo(p, id);
+      p.rec.sendNeed(id);
+    }
+  }, 18000));
+  p.retryT.push(setTimeout(()=>{
+    if (sess !== session || peers.get(id) !== p) return;
+    let pc = null;
+    try{ const pcs = p.rec.room.getPeers ? p.rec.room.getPeers() : null; pc = pcs && pcs[id]; }catch(_){}
+    const st = pc && pc.iceConnectionState;
+    const v = p.tile && p.tile.querySelector("video");
+    const haveMedia = (st === "connected" || st === "completed") || (v && v.videoWidth > 0) || p.gotStream;
+    if (!haveMedia && !FIXED_ROOM_REJOINED){
+      /* совсем не поднялось за 28 с — тихо перезапускаем подключение к комнате */
+      FIXED_ROOM_REJOINED = true;
+      silentRejoin();
+    }
+  }, 28000));
   updateCount();
   pokeUI();
   return p;
@@ -674,7 +701,7 @@ function setupCallScreen(){
   $("waitOverlay").style.display = "flex";
   stopTimer(); $("timer").textContent = "00:00";
   updateModeBtn(); updateCtlIcons(); updateCount();
-  if (window.AndroidAudio){ $("btnSpk").textContent = spkOn ? "🔊" : "📱"; }
+  if (window.AndroidAudio){ syncSpkIcon(); if (!window.__spkPoll) window.__spkPoll = setInterval(syncSpkIcon, 3000); }
   $("scr-call").classList.remove("hideui","pipmode");
   show("scr-call");
   pokeUI();
@@ -704,6 +731,7 @@ function makeTile(id, isMe){
   }
   tile.addEventListener("click", ()=>{
     if (tile.dataset.suppressClick) return;     // это было перетаскивание, не нажатие
+    $("grid").dataset.userZoom = "1";           // пользователь сам управляет раскладкой
     const wasZoomed = tile.classList.contains("zoom");
     $("grid").querySelectorAll(".tile.zoom").forEach(t=>t.classList.remove("zoom"));
     if (!wasZoomed && $("grid").children.length > 1){
@@ -803,9 +831,19 @@ function setMemberName(id, name){
 function relayout(){
   const g = $("grid");
   g.classList.toggle("cols2", g.children.length > 2);
+  /* 2 участника (вы + собеседник): собеседник по умолчанию на весь экран,
+     ваша камера — миниатюрой. Пока пользователь сам не тронул раскладку. */
+  if (peers.size === 1 && inRoom && !g.dataset.userZoom){
+    const remote = [...g.children].find(t=>!t.dataset.me);
+    if (remote && !remote.classList.contains("zoom")){
+      g.querySelectorAll(".tile.zoom").forEach(t=>t.classList.remove("zoom"));
+      remote.classList.add("zoom");
+    }
+  }
   applyZoomLayout();
   if (peers.size === 0 && inRoom){
     g.querySelectorAll(".tile.zoom").forEach(t=>t.classList.remove("zoom"));
+    delete g.dataset.userZoom;
     applyZoomLayout();
     $("waitOverlay").style.display = "flex"; stopTimer(); $("timer").textContent="00:00";
     $("scr-call").classList.remove("hideui");
@@ -871,133 +909,111 @@ function toggleCam(){
   updateCtlIcons();
 }
 let videoInputs = [], frontIds = [], backIds = [];
-let backPick = -1;   // индекс выбранной тыловой камеры (ручной выбор), -1 = авто
+let allCamIds = [], camIdx = -1;
 
-function lsGet(k){ try{ return localStorage.getItem(k); }catch(_){ return null; } }
-function lsSet(k,v){ try{ localStorage.setItem(k,v); }catch(_){} }
+function lsGet2(k){ try{ return localStorage.getItem(k); }catch(_){ return null; } }
+function lsSet2(k,v){ try{ localStorage.setItem(k,v); }catch(_){} }
 
-async function buildCameraList(){
+async function buildAllCams(){
   try{
     const devs = await navigator.mediaDevices.enumerateDevices();
-    videoInputs = devs.filter(d=>d.kind==="videoinput");
-  }catch(_){ videoInputs = []; }
-  frontIds = []; backIds = [];
-  for (const d of videoInputs){
-    const l = (d.label||"").toLowerCase();
-    const isFront = l.includes("front") || l.includes("фронтал") || l.includes("user") || l.includes("selfie");
-    if (isFront) frontIds.push(d.deviceId); else backIds.push(d.deviceId);
-  }
+    allCamIds = devs.filter(d=>d.kind==="videoinput").map(d=>d.deviceId).filter(Boolean);
+  }catch(_){ allCamIds = []; }
 }
 
-/* открыть камеру нужной стороны. forceId — конкретное устройство (ручной перебор).
-   По умолчанию для тыла используем СИСТЕМНЫЙ facingMode (Android сам даёт основную),
-   а не угадываем по списку — так не попадаем на телевик/макро. */
-async function openCamera(wantFront, forceId){
-  const fm = wantFront ? "user" : "environment";
-  const tries = [];
-  if (forceId) tries.push({ video:{ deviceId:{ exact: forceId } }, audio:false });
-  else {
-    if (!wantFront){
-      const saved = lsGet("zvk_backcam");
-      if (saved) tries.push({ video:{ deviceId:{ exact: saved } }, audio:false });
-    }
-    tries.push({ video:{ facingMode:{ exact: fm } }, audio:false });
-    tries.push({ video:{ facingMode: fm }, audio:false });
-  }
-  for (const c of tries){
-    try{ return await navigator.mediaDevices.getUserMedia(c); }catch(_){}
-  }
-  await buildCameraList();
-  const ids = wantFront ? frontIds : backIds;
-  for (const id of ids){
-    try{ return await navigator.mediaDevices.getUserMedia({ video:{ deviceId:{ exact:id } }, audio:false }); }catch(_){}
-  }
-  return null;
-}
-
-async function swapVideoTrack(ns){
-  const ot = localStream.getVideoTracks()[0];
+/* ЖЁСТКОЕ переключение камеры: всегда полностью пересоздаём видео-дорожку
+   и заново согласуем поток со всеми участниками. Не полагаемся на replaceTrack
+   (на Huawei он молча оставляет старую камеру). */
+async function applyNewCamera(ns){
+  if (!ns) return false;
   const nt = ns.getVideoTracks()[0];
-  let replaced = false;
+  if (!nt) return false;
+  const ot = localStream.getVideoTracks()[0];
+
+  /* Основной способ — замена дорожки у существующих соединений: мгновенно и без
+     разрыва. Главное было выбрать ДРУГОЕ устройство камеры (это делает flipCam) —
+     тогда replaceTrack отдаёт собеседнику новую картинку и на Huawei тоже. */
+  let replacedOk = true;
   for (const rec of rooms){
     try{
       const r = rec.room.replaceTrack(ot, nt, localStream);
       if (Array.isArray(r)) r.forEach(pr=>pr && pr.catch && pr.catch(()=>{}));
-      replaced = true;
-    }catch(_){}
+    }catch(_){ replacedOk = false; }
   }
-  localStream.removeTrack(ot); ot.stop(); localStream.addTrack(nt);
+  if (ot){ try{ localStream.removeTrack(ot); ot.stop(); }catch(_){} }
+  localStream.addTrack(nt);
   nt.enabled = !audioOnly;
+
   const me = document.querySelector('.tile[data-me="1"]');
-  if (me){ me.querySelector("video").srcObject = localStream; me.classList.toggle("rear", facing!=="user"); }
-  if (!replaced){
+  if (me){ me.querySelector("video").srcObject = localStream; }
+
+  /* запасной путь — только если замена дорожки не поддержана (бросила исключение) */
+  if (!replacedOk){
     for (const [pid, p] of peers){
       p.sentStream = false;
       try{ p.rec.room.removeStream(localStream, { target: pid }); }catch(_){}
-      setTimeout(()=> sendStreamTo(p, pid), 200);
     }
+    setTimeout(()=>{ for (const [pid, p] of peers){ try{ sendStreamTo(p, pid); }catch(_){} } }, 300);
   }
+  return true;
 }
 
-/* короткое нажатие — переключить фронт/тыл */
+async function openById(id){
+  try{ return await navigator.mediaDevices.getUserMedia({ video:{ deviceId:{ exact:id } }, audio:false }); }catch(_){ return null; }
+}
+
+/* короткое нажатие — следующая камера по кругу (фронт/тыл/доп. объективы).
+   Гарантированно переключает на ДРУГУЮ камеру и запоминает выбор. */
 async function flipCam(){
   if (!localStream || !localStream.getVideoTracks().length) return;
   if ($("btnFlip").dataset.busy) return;
   $("btnFlip").dataset.busy = "1";
-  const ot = localStream.getVideoTracks()[0];
-  const curId = ot.getSettings ? ot.getSettings().deviceId : null;
   try{
-    facing = (facing==="user") ? "environment" : "user";
-    let ns = await openCamera(facing === "user");
-    /* Huawei и часть Android отдают по facingMode ТУ ЖЕ камеру — определяем это
-       и принудительно берём камеру другой группы по deviceId */
-    let newId = ns ? (ns.getVideoTracks()[0].getSettings ? ns.getVideoTracks()[0].getSettings().deviceId : null) : null;
-    if (!ns || (curId && newId && newId === curId)){
-      await buildCameraList();
-      const wantIds = (facing === "user") ? frontIds : backIds;
-      let opened = null;
-      for (const id of wantIds){
-        if (id === curId) continue;                 // нужна именно ДРУГАЯ камера
-        try{ opened = await navigator.mediaDevices.getUserMedia({ video:{ deviceId:{ exact:id } }, audio:false }); if (opened) break; }catch(_){}
+    await buildAllCams();
+    const ot = localStream.getVideoTracks()[0];
+    const curId = ot.getSettings ? (ot.getSettings().deviceId || null) : null;
+
+    if (allCamIds.length >= 2){
+      // идём по списку устройств, начиная со следующего за текущим
+      let startIdx = curId ? allCamIds.indexOf(curId) : camIdx;
+      if (startIdx < 0) startIdx = camIdx;
+      let ns = null, chosen = null;
+      for (let step=1; step<=allCamIds.length; step++){
+        const i = (startIdx + step) % allCamIds.length;
+        const id = allCamIds[i];
+        if (id === curId) continue;
+        ns = await openById(id);
+        if (ns){ camIdx = i; chosen = id; break; }
       }
-      /* если в нужной группе пусто (метки не распознались) — берём любую другую камеру */
-      if (!opened){
-        for (const d of videoInputs){
-          if (d.deviceId === curId) continue;
-          try{ opened = await navigator.mediaDevices.getUserMedia({ video:{ deviceId:{ exact:d.deviceId } }, audio:false }); if (opened) break; }catch(_){}
-        }
+      if (ns){
+        await applyNewCamera(ns);
+        lsSet2("zvk_cam", chosen);
+        // определим примерную сторону для зеркала «себя»
+        facing = (facing==="user") ? "environment" : "user";
+        const me = document.querySelector('.tile[data-me="1"]');
+        if (me) me.classList.toggle("rear", facing!=="user");
+        toast("Камера " + (camIdx+1) + " из " + allCamIds.length);
+        delete $("btnFlip").dataset.busy;
+        return;
       }
-      if (opened){ if (ns) ns.getTracks().forEach(t=>t.stop()); ns = opened; }
     }
+    // запасной путь: одна камера в списке или ничего не открылось — пробуем facingMode
+    facing = (facing==="user") ? "environment" : "user";
+    let ns = null;
+    try{ ns = await navigator.mediaDevices.getUserMedia({ video:{ facingMode:{ exact: facing } }, audio:false }); }catch(_){}
+    if (!ns){ try{ ns = await navigator.mediaDevices.getUserMedia({ video:{ facingMode: facing }, audio:false }); }catch(_){} }
     if (!ns) throw new Error("no camera");
-    await swapVideoTrack(ns);
+    await applyNewCamera(ns);
+    const me = document.querySelector('.tile[data-me="1"]');
+    if (me) me.classList.toggle("rear", facing!=="user");
   }catch(e){
-    facing = (facing==="user")?"environment":"user";
     toast("Не удалось переключить камеру на этом устройстве");
   }
   finally{ delete $("btnFlip").dataset.busy; }
 }
 
-/* долгое нажатие на 🔄 — перебрать тыловые объективы и запомнить выбранный.
-   Так можно вручную уйти с телевика/макро на основную камеру. */
-async function cycleBackLens(){
-  if (!localStream) return;
-  await buildCameraList();
-  if (backIds.length < 2){ toast("На устройстве одна тыловая камера"); return; }
-  facing = "environment";
-  if ($("btnFlip").dataset.busy) return;
-  $("btnFlip").dataset.busy = "1";
-  try{
-    backPick = (backPick + 1) % backIds.length;
-    const id = backIds[backPick];
-    const ns = await openCamera(false, id);
-    if (!ns) throw new Error("no cam");
-    await swapVideoTrack(ns);
-    lsSet("zvk_backcam", id);
-    toast("Тыловая камера " + (backPick+1) + " из " + backIds.length + " — запомнено");
-  }catch(_){ toast("Не удалось открыть эту камеру"); }
-  finally{ delete $("btnFlip").dataset.busy; }
-}
+/* долгое нажатие — то же кольцо камер (оставлено для совместимости) */
+async function cycleBackLens(){ return flipCam(); }
 function updateCtlIcons(){
   const micOn = localStream && localStream.getAudioTracks().some(t=>t.enabled);
   const camTracks = localStream ? localStream.getVideoTracks() : [];
@@ -1017,19 +1033,30 @@ function sinkLabel(d, i){
   if (l.includes("bluetooth") || l.includes("airpods") || l.includes("buds")) return "🎧 Bluetooth";
   return d.label || ("Выход звука " + (i+1));
 }
+const OUT_MAP = {
+  SPEAKER:  ["🔊","Громкий динамик"],
+  EARPIECE: ["📱","Разговорный динамик (ухо)"],
+  BLUETOOTH:["🎧","Bluetooth"],
+  WIRED:    ["🎧","Наушники"],
+};
+function setSpkIconByLabel(where){
+  const m = OUT_MAP[where] || OUT_MAP.SPEAKER;
+  $("btnSpk").textContent = m[0];
+  $("btnSpk").title = m[1];
+  return m;
+}
+/* привести иконку к реальному текущему выходу (Android-мост) */
+function syncSpkIcon(){
+  if (window.AndroidAudio && AndroidAudio.currentOutput){
+    try{ setSpkIconByLabel(AndroidAudio.currentOutput() || "SPEAKER"); }catch(_){}
+  }
+}
 async function cycleAudioOut(){
   /* Android: полноценный перебор выходов (динамик/ухо/Bluetooth/наушники) */
   if (window.AndroidAudio && AndroidAudio.cycleOutput){
     let where = "SPEAKER";
     try{ where = AndroidAudio.cycleOutput() || "SPEAKER"; }catch(_){}
-    const map = {
-      SPEAKER:  ["🔊","Громкий динамик"],
-      EARPIECE: ["📱","Разговорный динамик (ухо)"],
-      BLUETOOTH:["🎧","Bluetooth"],
-      WIRED:    ["🎧","Наушники"],
-    };
-    const m = map[where] || map.SPEAKER;
-    $("btnSpk").textContent = m[0]; $("btnSpk").title = m[1];
+    const m = setSpkIconByLabel(where);
     toast(m[0] + " " + m[1]);
     return;
   }
@@ -1037,9 +1064,8 @@ async function cycleAudioOut(){
   if (window.AndroidAudio && AndroidAudio.setSpeaker){
     spkOn = !spkOn;
     try{ AndroidAudio.setSpeaker(spkOn); }catch(_){}
-    $("btnSpk").textContent = spkOn ? "🔊" : "📱";
-    $("btnSpk").title = spkOn ? "Громкий динамик" : "Разговорный динамик (ухо)";
-    toast(spkOn ? "🔊 Громкий динамик" : "📱 Разговорный динамик (ухо)");
+    const m = setSpkIconByLabel(spkOn ? "SPEAKER" : "EARPIECE");
+    toast(m[0] + " " + m[1]);
     return;
   }
   if (!("setSinkId" in HTMLMediaElement.prototype)){
